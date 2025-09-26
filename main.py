@@ -12,11 +12,12 @@ app = FastAPI(title="Stock Forecast API")
 # Allow Flutter frontend requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # in prod, restrict to your frontend domain
+    allow_origins=["*"],  # In prod, restrict this to your frontend domain
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ---------- Models ----------
 class PredictRequest(BaseModel):
     symbol: str = Field(..., example="INFY.NS")
     start_date: Optional[str] = Field(None, example="2024-01-01")
@@ -44,11 +45,17 @@ class PredictResponse(BaseModel):
     historical: List[OHLCPoint]
     forecast: List[ForecastPoint]
 
+# ---------- Utils ----------
 def download_data(symbol: str, start: str, end: str) -> pd.DataFrame:
     df = yf.download(tickers=symbol, start=start, end=end, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.droplevel(0)
     return df
+
+# ---------- Routes ----------
+@app.get("/")
+def root():
+    return {"message": "✅ Stock Forecast API is running on Render!"}
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
@@ -60,11 +67,16 @@ def predict(req: PredictRequest):
     elif req.time_period_type and req.time_period_value:
         days = req.time_period_value
         t = req.time_period_type.lower()
-        if t == "years": days *= 365
-        elif t == "months": days *= 30
-        elif t == "weeks": days *= 7
-        elif t == "days": days *= 1
-        else: raise HTTPException(status_code=400, detail="Invalid time_period_type")
+        if t == "years":
+            days *= 365
+        elif t == "months":
+            days *= 30
+        elif t == "weeks":
+            days *= 7
+        elif t == "days":
+            days *= 1
+        else:
+            raise HTTPException(status_code=400, detail="Invalid time_period_type")
 
         end_dt = datetime.date.today()
         start_dt = end_dt - datetime.timedelta(days=days)
@@ -72,6 +84,7 @@ def predict(req: PredictRequest):
     else:
         raise HTTPException(400, "Provide either (start_date,end_date) or (time_period_type,value)")
 
+    # Download historical data
     raw = download_data(symbol, start, end)
     if raw is None or raw.empty:
         raise HTTPException(404, f"No data for {symbol} between {start} and {end}")
@@ -89,12 +102,14 @@ def predict(req: PredictRequest):
             "volume": int(r["Volume"]) if not pd.isna(r["Volume"]) else 0
         })
 
+    # Prophet model
     df_prop = raw_reset[["Date", "Close"]].rename(columns={"Date": "ds", "Close": "y"}).dropna()
     if len(df_prop) < 3:
         raise HTTPException(400, "Not enough data for forecasting")
 
     model = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=True)
     model.fit(df_prop)
+
     future = model.make_future_dataframe(periods=req.predict_days)
     forecast = model.predict(future)
 
@@ -107,7 +122,7 @@ def predict(req: PredictRequest):
             "date": pd.to_datetime(r["ds"]).strftime("%Y-%m-%d"),
             "predicted": float(r["yhat"]),
             "lower": float(r["yhat_lower"]),
-            "upper": float(r["yhat_upper"])
+            "upper": float(r["yhat_upper"]),
         })
 
     return PredictResponse(symbol=symbol, historical=hist, forecast=forecast_list)
