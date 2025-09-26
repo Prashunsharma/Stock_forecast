@@ -78,11 +78,11 @@ def predict(req: PredictRequest):
         else:
             raise HTTPException(status_code=400, detail="Invalid time_period_type")
 
-        end_dt = datetime.date.today() - datetime.timedelta(days=1)
+        end_dt = datetime.date.today() + datetime.timedelta(days=1)  # tomorrow
         start_dt = end_dt - datetime.timedelta(days=days)
-
         start = start_dt.isoformat()
         end = end_dt.isoformat()
+
 
     else:
         raise HTTPException(400, "Provide either (start_date,end_date) or (time_period_type,value)")
@@ -129,5 +129,6 @@ def predict(req: PredictRequest):
         })
 
     return PredictResponse(symbol=symbol, historical=hist, forecast=forecast_list)
+
 
 
