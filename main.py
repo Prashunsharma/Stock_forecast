@@ -7,8 +7,9 @@ import pandas as pd
 from prophet import Prophet
 import datetime
 import logging
-from io import StringIO
-import sys
+import requests
+import time
+import random
 
 app = FastAPI(title="Stock Forecast API")
 
@@ -24,12 +25,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Custom session with proper headers to avoid Yahoo Finance blocking
+def create_session():
+    session = requests.Session()
+    # Updated headers to bypass Yahoo Finance blocking
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Cache-Control': 'max-age=0'
+    })
+    return session
+
 # ---------- Models ----------
 class PredictRequest(BaseModel):
     symbol: str = Field(..., example="INFY.NS")
     start_date: Optional[str] = Field(None, example="2023-01-01")
     end_date: Optional[str] = Field(None, example="2024-09-25")
-    time_period_type: Optional[str] = Field(None, example="Months")  # Days/Weeks/Months/Years
+    time_period_type: Optional[str] = Field(None, example="Months")
     time_period_value: Optional[int] = Field(None, example=12)
     predict_days: int = Field(..., example=30)
 
@@ -61,65 +78,8 @@ class DebugResponse(BaseModel):
     error: Optional[str] = None
 
 # ---------- Utils ----------
-def test_symbol_availability(symbol: str) -> dict:
-    """Test if a symbol is available and return debug info"""
-    try:
-        ticker = yf.Ticker(symbol)
-        
-        # Try to get basic info
-        try:
-            info = ticker.info
-            logger.info(f"Ticker info available for {symbol}")
-        except Exception as e:
-            logger.warning(f"No ticker info for {symbol}: {e}")
-            info = {}
-        
-        # Try recent data (last 5 days)
-        end_date = datetime.date.today()
-        start_date = end_date - datetime.timedelta(days=5)
-        
-        try:
-            recent_data = yf.download(symbol, start=start_date, end=end_date, progress=False)
-            logger.info(f"Recent data shape for {symbol}: {recent_data.shape}")
-        except Exception as e:
-            logger.error(f"Failed to get recent data for {symbol}: {e}")
-            recent_data = pd.DataFrame()
-        
-        # Try longer period (1 year)
-        start_1y = end_date - datetime.timedelta(days=365)
-        try:
-            yearly_data = yf.download(symbol, start=start_1y, end=end_date, progress=False)
-            logger.info(f"Yearly data shape for {symbol}: {yearly_data.shape}")
-        except Exception as e:
-            logger.error(f"Failed to get yearly data for {symbol}: {e}")
-            yearly_data = pd.DataFrame()
-        
-        return {
-            "symbol": symbol,
-            "info_available": bool(info),
-            "recent_data_points": len(recent_data),
-            "yearly_data_points": len(yearly_data),
-            "recent_date_range": {
-                "start": start_date.isoformat(),
-                "end": end_date.isoformat()
-            },
-            "yearly_date_range": {
-                "start": start_1y.isoformat(),
-                "end": end_date.isoformat()
-            }
-        }
-    except Exception as e:
-        logger.error(f"Symbol test failed for {symbol}: {e}")
-        return {
-            "symbol": symbol,
-            "error": str(e),
-            "info_available": False,
-            "recent_data_points": 0,
-            "yearly_data_points": 0
-        }
-
-def download_data_robust(symbol: str, start: str, end: str) -> tuple[pd.DataFrame, dict]:
-    """Download stock data with multiple retry strategies and debug info"""
+def download_data_with_fallbacks(symbol: str, start: str, end: str) -> tuple[pd.DataFrame, dict]:
+    """Download stock data with multiple fallback strategies"""
     debug_info = {
         "symbol": symbol,
         "requested_range": {"start": start, "end": end},
@@ -127,29 +87,46 @@ def download_data_robust(symbol: str, start: str, end: str) -> tuple[pd.DataFram
         "final_data_points": 0
     }
     
-    # Strategy 1: Direct download with requested dates
+    # Strategy 1: yfinance with custom session and headers
     try:
-        logger.info(f"Attempt 1: Direct download for {symbol} from {start} to {end}")
-        df = yf.download(tickers=symbol, start=start, end=end, progress=False)
+        logger.info(f"Attempt 1: yfinance with custom session for {symbol}")
+        
+        # Create a custom session
+        session = create_session()
+        
+        # Add random delay to avoid rate limiting
+        time.sleep(random.uniform(0.1, 0.5))
+        
+        # Try with custom session
+        df = yf.download(
+            tickers=symbol, 
+            start=start, 
+            end=end, 
+            progress=False,
+            session=session,
+            timeout=30
+        )
         
         if not df.empty:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(0)
-            debug_info["attempts"].append({"method": "direct", "success": True, "data_points": len(df)})
+            debug_info["attempts"].append({"method": "custom_session", "success": True, "data_points": len(df)})
             debug_info["final_data_points"] = len(df)
-            logger.info(f"Direct download successful: {len(df)} points")
+            logger.info(f"Custom session download successful: {len(df)} points")
             return df, debug_info
         else:
-            debug_info["attempts"].append({"method": "direct", "success": False, "error": "Empty dataframe"})
+            debug_info["attempts"].append({"method": "custom_session", "success": False, "error": "Empty dataframe"})
             
     except Exception as e:
-        logger.warning(f"Direct download failed: {e}")
-        debug_info["attempts"].append({"method": "direct", "success": False, "error": str(e)})
+        logger.warning(f"Custom session download failed: {e}")
+        debug_info["attempts"].append({"method": "custom_session", "success": False, "error": str(e)})
     
-    # Strategy 2: Use period parameter instead of dates
+    # Strategy 2: Direct yfinance with period
     try:
-        logger.info(f"Attempt 2: Using period parameter for {symbol}")
-        df = yf.download(tickers=symbol, period="1y", progress=False)
+        logger.info(f"Attempt 2: yfinance with period for {symbol}")
+        time.sleep(random.uniform(0.1, 0.5))
+        
+        df = yf.download(tickers=symbol, period="1y", progress=False, timeout=30)
         
         if not df.empty:
             if isinstance(df.columns, pd.MultiIndex):
@@ -165,45 +142,107 @@ def download_data_robust(symbol: str, start: str, end: str) -> tuple[pd.DataFram
         logger.warning(f"Period download failed: {e}")
         debug_info["attempts"].append({"method": "period_1y", "success": False, "error": str(e)})
     
-    # Strategy 3: Try with Ticker object
+    # Strategy 3: Ticker object with custom session
     try:
-        logger.info(f"Attempt 3: Using Ticker object for {symbol}")
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(start=start, end=end)
+        logger.info(f"Attempt 3: Ticker object with custom session for {symbol}")
+        time.sleep(random.uniform(0.1, 0.5))
+        
+        session = create_session()
+        ticker = yf.Ticker(symbol, session=session)
+        df = ticker.history(start=start, end=end, timeout=30)
         
         if not df.empty:
-            # Rename columns to match expected format
-            if 'Close' not in df.columns and 'close' in df.columns:
-                df = df.rename(columns={'close': 'Close', 'open': 'Open', 'high': 'High', 'low': 'Low', 'volume': 'Volume'})
-            debug_info["attempts"].append({"method": "ticker_history", "success": True, "data_points": len(df)})
+            debug_info["attempts"].append({"method": "ticker_custom_session", "success": True, "data_points": len(df)})
             debug_info["final_data_points"] = len(df)
-            logger.info(f"Ticker history successful: {len(df)} points")
+            logger.info(f"Ticker custom session successful: {len(df)} points")
             return df, debug_info
         else:
-            debug_info["attempts"].append({"method": "ticker_history", "success": False, "error": "Empty dataframe"})
+            debug_info["attempts"].append({"method": "ticker_custom_session", "success": False, "error": "Empty dataframe"})
             
     except Exception as e:
-        logger.warning(f"Ticker history failed: {e}")
-        debug_info["attempts"].append({"method": "ticker_history", "success": False, "error": str(e)})
+        logger.warning(f"Ticker custom session failed: {e}")
+        debug_info["attempts"].append({"method": "ticker_custom_session", "success": False, "error": str(e)})
     
-    # Strategy 4: Try shorter period if long period failed
+    # Strategy 4: Try with different periods using Ticker
+    periods = ["1y", "6mo", "3mo", "1mo"]
+    for period in periods:
+        try:
+            logger.info(f"Attempt 4.{periods.index(period)+1}: Ticker with {period} period for {symbol}")
+            time.sleep(random.uniform(0.1, 0.5))
+            
+            session = create_session()
+            ticker = yf.Ticker(symbol, session=session)
+            df = ticker.history(period=period, timeout=30)
+            
+            if not df.empty:
+                debug_info["attempts"].append({"method": f"ticker_{period}", "success": True, "data_points": len(df)})
+                debug_info["final_data_points"] = len(df)
+                logger.info(f"Ticker {period} successful: {len(df)} points")
+                return df, debug_info
+            else:
+                debug_info["attempts"].append({"method": f"ticker_{period}", "success": False, "error": "Empty dataframe"})
+                
+        except Exception as e:
+            logger.warning(f"Ticker {period} failed: {e}")
+            debug_info["attempts"].append({"method": f"ticker_{period}", "success": False, "error": str(e)})
+    
+    # Strategy 5: Try alternative data source (fallback to US symbol if Indian)
+    if symbol.endswith('.NS') or symbol.endswith('.BO'):
+        alt_symbol = symbol.replace('.NS', '').replace('.BO', '')
+        try:
+            logger.info(f"Attempt 5: Trying alternative symbol {alt_symbol} for {symbol}")
+            time.sleep(random.uniform(0.1, 0.5))
+            
+            session = create_session()
+            df = yf.download(tickers=alt_symbol, period="1y", progress=False, session=session, timeout=30)
+            
+            if not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.droplevel(0)
+                debug_info["attempts"].append({"method": "alternative_symbol", "success": True, "data_points": len(df), "alt_symbol": alt_symbol})
+                debug_info["final_data_points"] = len(df)
+                logger.info(f"Alternative symbol {alt_symbol} successful: {len(df)} points")
+                return df, debug_info
+            else:
+                debug_info["attempts"].append({"method": "alternative_symbol", "success": False, "error": "Empty dataframe", "alt_symbol": alt_symbol})
+                
+        except Exception as e:
+            logger.warning(f"Alternative symbol {alt_symbol} failed: {e}")
+            debug_info["attempts"].append({"method": "alternative_symbol", "success": False, "error": str(e), "alt_symbol": alt_symbol})
+    
+    # Strategy 6: Manual Yahoo Finance URL (last resort)
     try:
-        logger.info(f"Attempt 4: Using shorter period (6m) for {symbol}")
-        df = yf.download(tickers=symbol, period="6mo", progress=False)
+        logger.info(f"Attempt 6: Manual Yahoo Finance API for {symbol}")
+        time.sleep(random.uniform(0.1, 0.5))
         
-        if not df.empty:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(0)
-            debug_info["attempts"].append({"method": "period_6mo", "success": True, "data_points": len(df)})
-            debug_info["final_data_points"] = len(df)
-            logger.info(f"6-month period download successful: {len(df)} points")
-            return df, debug_info
+        # Convert dates to timestamps
+        start_ts = int(datetime.datetime.strptime(start, "%Y-%m-%d").timestamp())
+        end_ts = int(datetime.datetime.strptime(end, "%Y-%m-%d").timestamp())
+        
+        url = f"https://query1.finance.yahoo.com/v7/finance/download/{symbol}?period1={start_ts}&period2={end_ts}&interval=1d&events=history"
+        
+        session = create_session()
+        response = session.get(url, timeout=30)
+        
+        if response.status_code == 200 and response.text and not response.text.startswith('<!DOCTYPE html>'):
+            from io import StringIO
+            df = pd.read_csv(StringIO(response.text))
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date')
+            
+            if not df.empty:
+                debug_info["attempts"].append({"method": "manual_yahoo_api", "success": True, "data_points": len(df)})
+                debug_info["final_data_points"] = len(df)
+                logger.info(f"Manual Yahoo API successful: {len(df)} points")
+                return df, debug_info
+            else:
+                debug_info["attempts"].append({"method": "manual_yahoo_api", "success": False, "error": "Empty dataframe from API"})
         else:
-            debug_info["attempts"].append({"method": "period_6mo", "success": False, "error": "Empty dataframe"})
+            debug_info["attempts"].append({"method": "manual_yahoo_api", "success": False, "error": f"HTTP {response.status_code}"})
             
     except Exception as e:
-        logger.warning(f"6-month period download failed: {e}")
-        debug_info["attempts"].append({"method": "period_6mo", "success": False, "error": str(e)})
+        logger.warning(f"Manual Yahoo API failed: {e}")
+        debug_info["attempts"].append({"method": "manual_yahoo_api", "success": False, "error": str(e)})
     
     # All strategies failed
     debug_info["final_error"] = "All download strategies failed"
@@ -226,15 +265,32 @@ def health_check():
 def debug_symbol(symbol: str):
     """Debug endpoint to test symbol availability"""
     symbol = symbol.strip().upper()
-    debug_info = test_symbol_availability(symbol)
     
-    return DebugResponse(
-        symbol=symbol,
-        raw_data_available=debug_info.get("yearly_data_points", 0) > 0,
-        data_points=debug_info.get("yearly_data_points", 0),
-        date_range=debug_info.get("yearly_date_range", {}),
-        error=debug_info.get("error")
-    )
+    try:
+        # Quick test with the new download function
+        end_date = datetime.date.today()
+        start_date = end_date - datetime.timedelta(days=30)  # Last 30 days
+        
+        df, debug_info = download_data_with_fallbacks(symbol, start_date.isoformat(), end_date.isoformat())
+        
+        return DebugResponse(
+            symbol=symbol,
+            raw_data_available=len(df) > 0,
+            data_points=len(df),
+            date_range={
+                "start": str(df.index.min()) if not df.empty else None,
+                "end": str(df.index.max()) if not df.empty else None
+            },
+            error=debug_info.get("final_error") if df.empty else None
+        )
+    except Exception as e:
+        return DebugResponse(
+            symbol=symbol,
+            raw_data_available=False,
+            data_points=0,
+            date_range={},
+            error=str(e)
+        )
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
@@ -245,14 +301,12 @@ def predict(req: PredictRequest):
         # Resolve dates
         if req.start_date and req.end_date:
             start, end = req.start_date, req.end_date
-            # Validate date format and order
             try:
                 start_dt = datetime.datetime.strptime(start, "%Y-%m-%d")
                 end_dt = datetime.datetime.strptime(end, "%Y-%m-%d")
                 if start_dt >= end_dt:
                     raise HTTPException(400, "start_date must be before end_date")
                 if end_dt > datetime.datetime.now():
-                    # Adjust end date to today if it's in the future
                     end = datetime.date.today().isoformat()
             except ValueError:
                 raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD")
@@ -270,9 +324,8 @@ def predict(req: PredictRequest):
             elif t == "days":
                 days *= 1
             else:
-                raise HTTPException(status_code=400, detail="Invalid time_period_type. Use: days, weeks, months, or years")
+                raise HTTPException(400, "Invalid time_period_type. Use: days, weeks, months, or years")
 
-            # Calculate date range - go back from today
             end_dt = datetime.date.today()
             start_dt = end_dt - datetime.timedelta(days=days)
             start = start_dt.isoformat()
@@ -281,57 +334,41 @@ def predict(req: PredictRequest):
             logger.info(f"Calculated date range: {start} to {end} ({days} days)")
 
         else:
-            # Default: last 1 year of data
             end_dt = datetime.date.today()
             start_dt = end_dt - datetime.timedelta(days=365)
             start = start_dt.isoformat()
             end = end_dt.isoformat()
             logger.info(f"Using default date range: {start} to {end}")
 
-        # Download historical data with robust method
-        raw, debug_info = download_data_robust(symbol, start, end)
+        # Download historical data with all fallback strategies
+        raw, debug_info = download_data_with_fallbacks(symbol, start, end)
         
         if raw is None or raw.empty:
-            # Create detailed error message
-            error_details = {
-                "symbol": symbol,
-                "requested_range": {"start": start, "end": end},
-                "debug_info": debug_info,
-                "suggestions": [
-                    "Try a different symbol format (e.g., TCS.NS, TCS.BO for Indian stocks)",
-                    "Check if the symbol exists on Yahoo Finance website",
-                    "Try a different date range",
-                    f"Use the debug endpoint: GET /debug/{symbol}"
-                ]
-            }
             raise HTTPException(
                 404, 
-                f"No data found for {symbol}. Please check the debug info and suggestions.",
-                # details=error_details  # FastAPI will include this in response
+                f"Unable to fetch data for {symbol}. All download methods failed. "
+                f"Please check if the symbol is correct or try a different symbol. "
+                f"Debug info: {debug_info.get('final_error', 'Unknown error')}"
             )
 
-        # Check if we have sufficient data
         if len(raw) < 10:
             raise HTTPException(400, f"Insufficient data for {symbol}. Found only {len(raw)} data points. Need at least 10.")
 
-        # Historical OHLC
+        # Process historical OHLC data
         raw_reset = raw.reset_index()
         hist = []
         
         # Handle different column formats
-        date_col = 'Date' if 'Date' in raw_reset.columns else raw_reset.index.name or 'Date'
-        if date_col not in raw_reset.columns:
-            raw_reset = raw_reset.reset_index()
-            date_col = raw_reset.columns[0]
+        date_col = 'Date' if 'Date' in raw_reset.columns else raw_reset.columns[0]
         
         for _, r in raw_reset.iterrows():
             try:
                 hist.append({
                     "date": pd.to_datetime(r[date_col]).strftime("%Y-%m-%d"),
-                    "open": float(r["Open"]) if not pd.isna(r["Open"]) else 0.0,
-                    "high": float(r["High"]) if not pd.isna(r["High"]) else 0.0,
-                    "low": float(r["Low"]) if not pd.isna(r["Low"]) else 0.0,
-                    "close": float(r["Close"]) if not pd.isna(r["Close"]) else 0.0,
+                    "open": float(r["Open"]) if "Open" in r and not pd.isna(r["Open"]) else 0.0,
+                    "high": float(r["High"]) if "High" in r and not pd.isna(r["High"]) else 0.0,
+                    "low": float(r["Low"]) if "Low" in r and not pd.isna(r["Low"]) else 0.0,
+                    "close": float(r["Close"]) if "Close" in r and not pd.isna(r["Close"]) else 0.0,
                     "volume": int(r["Volume"]) if "Volume" in r and not pd.isna(r["Volume"]) else 0
                 })
             except Exception as e:
@@ -341,7 +378,7 @@ def predict(req: PredictRequest):
         if len(hist) == 0:
             raise HTTPException(400, "No valid historical data points found after processing")
 
-        # Prophet model
+        # Prepare data for Prophet
         df_prop = raw_reset[[date_col, "Close"]].rename(columns={date_col: "ds", "Close": "y"}).dropna()
         
         if len(df_prop) < 10:
@@ -349,14 +386,14 @@ def predict(req: PredictRequest):
 
         logger.info(f"Training Prophet model with {len(df_prop)} data points")
         
-        # Configure Prophet with better parameters for stock data
+        # Configure Prophet
         model = Prophet(
             daily_seasonality=False,
             weekly_seasonality=True,
             yearly_seasonality=True,
             seasonality_mode='multiplicative',
             changepoint_prior_scale=0.05,
-            interval_width=0.8  # 80% confidence interval
+            interval_width=0.8
         )
         
         model.fit(df_prop)
@@ -407,7 +444,7 @@ def get_popular_symbols():
         "us_stocks": [
             "AAPL", "GOOGL", "MSFT", "TSLA", "AMZN", "NVDA"
         ],
-        "note": "Use .NS for NSE (National Stock Exchange) or .BO for BSE (Bombay Stock Exchange) for Indian stocks"
+        "note": "Try US stocks first to test if the API works, then try Indian stocks"
     }
 
 @app.get("/test-download/{symbol}")
@@ -415,7 +452,7 @@ def test_download(symbol: str):
     """Quick test endpoint to check if data download works"""
     try:
         symbol = symbol.strip().upper()
-        raw, debug_info = download_data_robust(symbol, "2023-01-01", "2024-09-25")
+        raw, debug_info = download_data_with_fallbacks(symbol, "2023-01-01", "2024-09-25")
         
         return {
             "symbol": symbol,
