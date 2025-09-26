@@ -78,11 +78,9 @@ def predict(req: PredictRequest):
         else:
             raise HTTPException(status_code=400, detail="Invalid time_period_type")
 
-        end_dt = datetime.date.today()  # today
+        end_dt = datetime.date.today() - datetime.timedelta(days=1)
         start_dt = end_dt - datetime.timedelta(days=days)
 
-# Ensure end date doesn't go into the future
-# Also note: yfinance `end` is exclusive, so we don't need to +1
         start = start_dt.isoformat()
         end = end_dt.isoformat()
 
@@ -131,4 +129,5 @@ def predict(req: PredictRequest):
         })
 
     return PredictResponse(symbol=symbol, historical=hist, forecast=forecast_list)
+
 
